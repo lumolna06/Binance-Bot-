@@ -1,0 +1,244 @@
+# bot_ema_realtime_vela.py
+import json
+import time
+import threading
+import websocket
+from datetime import datetime, timezone
+from collections import deque
+from binance.client import Client
+from binance.enums import *
+
+# ===== IMPORTAR CLASE EMA =====
+from EMA import EMARealtime  # Ajusta el nombre si tu archivo es diferente
+
+# ===== CONFIGURACIÓN =====
+API_KEY = "KNOHovcOWEDLeQkXh6xT27ZEwGnNN9r1kkBpefE36tgGpG7MyN7XjYv99byJG1xp"
+API_SECRET = "81Q1smIhahcj7XjgJDfJwcp7v3mbb4MvQaLg42mF3R0TJO25GZxRO84j6g6MDOMZ"
+
+SYMBOL = "ETHUSDC"
+MONTO_USD = 0
+APALANCAMIENTO = 10
+
+DELTA_MINIMO = 2000
+CONSISTENT_SIGNALS = 15
+TAKE_PROFIT_PCT = 0.003
+EMA_INTERVAL = '30m'
+MAX_TRADES = 5000
+RESET_CADA_HORAS = 1
+
+# ===== VARIABLES GLOBALES =====
+pos_actual = None
+ultima_senal = None
+contador_senal = 0
+deltas_recientes = []
+historial_deltas = deque(maxlen=10)
+
+ultima_ema_ts = None
+
+# ===== CONEXIÓN BINANCE =====
+client = Client(API_KEY, API_SECRET)
+
+# ===== INSTANCIAR EMA =====
+ema_handler = EMARealtime(client, symbol=SYMBOL, interval=EMA_INTERVAL, length=200, data_limit=1500)
+
+# ===== FUNCIONES AUXILIARES =====
+def ajustar_cantidad(precio):
+    return round(MONTO_USD / precio, 3)
+
+def cancelar_ordenes_pendientes():
+    try:
+        ordenes = client.futures_get_open_orders(symbol=SYMBOL)
+        for o in ordenes:
+            client.futures_cancel_order(symbol=SYMBOL, orderId=o["orderId"])
+        if ordenes:
+            print(f"🧹 {len(ordenes)} órdenes pendientes canceladas.")
+    except Exception as e:
+        print("❌ Error cancelando órdenes pendientes:", e)
+
+def cerrar_todas():
+    global pos_actual
+    try:
+        posiciones = client.futures_position_information(symbol=SYMBOL)
+        for p in posiciones:
+            qty = float(p["positionAmt"])
+            if qty != 0:
+                lado = SIDE_SELL if qty > 0 else SIDE_BUY
+                print(f"🧹 Cerrando posición {lado} de {abs(qty)} ETH")
+                client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=lado,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=abs(qty)
+                )
+        pos_actual = None
+    except Exception as e:
+        print("❌ Error cerrando posiciones:", e)
+
+def abrir_posicion(tipo):
+    global pos_actual
+    try:
+        cancelar_ordenes_pendientes()
+        cerrar_todas()
+
+        ticker = client.futures_symbol_ticker(symbol=SYMBOL)
+        precio = float(ticker["price"])
+        qty = ajustar_cantidad(precio)
+        client.futures_change_leverage(symbol=SYMBOL, leverage=APALANCAMIENTO)
+
+        # Filtro EMA
+        ema200 = float(ema_handler.get_ema())
+        if tipo == "long" and precio <= ema200:
+            print(f"✋ Filtro EMA: precio {precio:.4f} <= EMA200 {ema200:.4f} -> NO abrir LONG")
+            return
+        if tipo == "short" and precio >= ema200:
+            print(f"✋ Filtro EMA: precio {precio:.4f} >= EMA200 {ema200:.4f} -> NO abrir SHORT")
+            return
+
+        lado = SIDE_BUY if tipo == "long" else SIDE_SELL
+        print(f"🚀 Abriendo {tipo.upper()} por {qty} ETH @ {precio}")
+
+        client.futures_create_order(
+            symbol=SYMBOL,
+            side=lado,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+
+        # Take profit
+        if tipo == "long":
+            tp_price = round(precio * (1 + TAKE_PROFIT_PCT), 2)
+            tp_side = SIDE_SELL
+        else:
+            tp_price = round(precio * (1 - TAKE_PROFIT_PCT), 2)
+            tp_side = SIDE_BUY
+
+        client.futures_create_order(
+            symbol=SYMBOL,
+            side=tp_side,
+            type=ORDER_TYPE_LIMIT,
+            timeInForce=TIME_IN_FORCE_GTC,
+            quantity=qty,
+            price=str(tp_price),
+            reduceOnly=True
+        )
+
+        print(f"🎯 Take profit {tp_side} establecido en {tp_price}")
+        pos_actual = tipo
+    except Exception as e:
+        print("❌ Error abriendo posición:", e)
+
+# ===== HISTÓRICO =====
+def cargar_trades_historicos():
+    global deltas_recientes
+    try:
+        print(f"⏳ Descargando trades recientes para {SYMBOL}...")
+        trades = []
+        while len(trades) < MAX_TRADES:
+            nuevos = client.futures_recent_trades(symbol=SYMBOL, limit=1000)
+            trades.extend(nuevos)
+            time.sleep(0.2)
+            if len(trades) >= MAX_TRADES:
+                break
+        trades = trades[-MAX_TRADES:]
+
+        deltas_recientes.clear()
+        for t in trades:
+            qty = float(t["qty"])
+            ts = datetime.fromtimestamp(t["time"] / 1000, tz=timezone.utc)
+            is_sell = t["isBuyerMaker"]
+            deltas_recientes.append({"time": ts, "qty": -qty if is_sell else qty})
+
+        print(f"✅ {len(deltas_recientes)} trades cargados (máx {MAX_TRADES}).")
+    except Exception as e:
+        print("❌ Error al cargar trades históricos:", e)
+
+# ===== REINICIO PROGRAMADO =====
+def reset_bot_periodico():
+    global deltas_recientes, historial_deltas, ultima_senal, contador_senal, pos_actual
+    while True:
+        time.sleep(RESET_CADA_HORAS * 3600)
+        try:
+            print(f"\n♻️ ===== Reinicio del bot ({RESET_CADA_HORAS}h) =====")
+            deltas_recientes = []
+            historial_deltas = deque(maxlen=10)
+            ultima_senal = None
+            contador_senal = 0
+            pos_actual = None
+            cargar_trades_historicos()
+            # Actualizar EMA con últimas velas
+            ema_handler.inicializar_ema()
+            print("♻️ Reinicio completo realizado.\n")
+        except Exception as e:
+            print("❌ Error durante reinicio:", e)
+
+# ===== CALLBACK WEBSOCKET =====
+def on_message(ws, message):
+    global deltas_recientes, ultima_senal, contador_senal, pos_actual, ultima_ema_ts
+    try:
+        data = json.loads(message)
+        ahora = datetime.now(timezone.utc)
+
+        # --- Procesar trade ---
+        qty = float(data["q"])
+        is_sell = data["m"]
+        precio = float(data["p"])
+        deltas_recientes.append({"time": ahora, "qty": -qty if is_sell else qty})
+
+        if len(deltas_recientes) > MAX_TRADES:
+            deltas_recientes = deltas_recientes[-MAX_TRADES:]
+
+        compras = sum(d["qty"] for d in deltas_recientes if d["qty"] > 0)
+        ventas = sum(-d["qty"] for d in deltas_recientes if d["qty"] < 0)
+        delta_actual = compras - ventas
+
+        # --- Actualizar EMA solo en cierre de vela ---
+        now_ts = datetime.now(timezone.utc)
+        if not ultima_ema_ts or (now_ts - ultima_ema_ts).total_seconds() >= 1800:  # 30m
+            ema_handler.inicializar_ema()  # recalcula EMA con la última vela
+            ultima_ema_ts = now_ts
+
+        ema200 = float(ema_handler.get_ema())
+        ema_texto = f"{ema200:.2f}" if ema200 else "N/A"
+
+        print(f"🟢 {ahora.strftime('%H:%M:%S')} | Δ: {delta_actual:.2f} | Precio: {precio:.2f} | EMA200: {ema_texto}")
+
+        # --- Lógica de señal ---
+        if pos_actual is None and ema200 is not None:
+            if delta_actual >= DELTA_MINIMO and precio > ema200:
+                if ultima_senal == "long":
+                    contador_senal += 1
+                else:
+                    contador_senal = 1
+                    ultima_senal = "long"
+                if contador_senal >= CONSISTENT_SIGNALS:
+                    abrir_posicion("long")
+                    contador_senal = 0
+
+            elif delta_actual <= -DELTA_MINIMO and precio < ema200:
+                if ultima_senal == "short":
+                    contador_senal += 1
+                else:
+                    contador_senal = 1
+                    ultima_senal = "short"
+                if contador_senal >= CONSISTENT_SIGNALS:
+                    abrir_posicion("short")
+                    contador_senal = 0
+
+    except Exception as e:
+        print("❌ Error en on_message:", e)
+
+# ===== MAIN =====
+def main():
+    cargar_trades_historicos()
+    # Inicializar EMA exclusivamente usando la clase
+    ema_handler.inicializar_ema()
+
+    threading.Thread(target=reset_bot_periodico, daemon=True).start()
+
+    stream_url = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@trade"
+    ws = websocket.WebSocketApp(stream_url, on_message=on_message)
+    print("🚀 Bot iniciado y escuchando trades en tiempo real...")
+    ws.run_forever()
+
+if __name__ == "__main__":
+    main()
