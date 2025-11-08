@@ -40,8 +40,8 @@ logging.error("❌ Error de ejemplo: prueba de envío a Telegram")
 
 # ===== CONFIGURACIÓN =====
 # bien
-API_KEY = "KNOHovcOWEDLeQkXh6xT27ZEwGnNN9r1kkBpefE36tgGpG7MyN7XjYv99byJG1xp"
-API_SECRET = "81Q1smIhahcj7XjgJDfJwcp7v3mbb4MvQaLg42mF3R0TJO25GZxRO84j6g6MDOMZ"
+API_KEY = " "
+API_SECRET = " "
 
 SYMBOL = "ETHUSDC"
 MONTO_USD = 25
